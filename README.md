@@ -1,251 +1,360 @@
 # Instantly.ai MCP Server
 
-A production-quality, role-based Model Context Protocol (MCP) server for the **Instantly.ai API v2**.
+A secure, role-based [Model Context Protocol (MCP)] server for the Instantly.ai API v2.
 
-> **Pitch**: *"A small, secure MCP server for Instantly, read-only by default."* Built with Node.js 20+, TypeScript, Express, and the official `@modelcontextprotocol/sdk`. Designed for code clarity, defense-in-depth security, and robust tool ergonomics over feature count.
+Built with **Node.js, TypeScript, Express, Zod, Pino, and the official MCP SDK**.
+
+> **Goal:** expose a focused set of Instantly operations to MCP clients while keeping write actions behind explicit roles and guardrails.
+
+##  Live Server
+
+**MCP endpoint**
+
+`https://nstantly-mcp-server.onrender.com/mcp`
+
+**Health check**
+
+`https://nstantly-mcp-server.onrender.com/health`
+
+The server is deployed as a **Render Web Service** and uses Streamable HTTP.
+
+Authentication is required for `/mcp`:
+
+```text
+Authorization: Bearer <YOUR_ROLE_TOKEN>
+```
+
+No Instantly API credentials are exposed to the MCP client. The Instantly API key stays server-side.
 
 ---
 
-## Architecture Overview
+## What It Does
+
+The server connects MCP clients such as **MCP Inspector, Cursor, or Claude Code/Desktop** to Instantly's API through a controlled tool layer.
+
+Key characteristics:
+
+- **9 focused MCP tools** instead of exposing the entire upstream API.
+- **Three roles:** Viewer, Operator, Admin.
+- **Read-only by default.**
+- **Two-layer RBAC**: unauthorized tools are hidden and calls are checked again server-side.
+- **Zod validation** for tool inputs.
+- **Stateless Streamable HTTP** for simple horizontal scaling.
+- **Timeouts and safe retries** for transient upstream GET failures.
+- **Structured audit logging** with secret redaction.
+- **Prompt-injection-aware output handling** for untrusted lead/campaign text.
+- **Mock mode** for local development without making real Instantly changes.
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph Clients["MCP Clients"]
-        Cursor["Cursor"]
-        Claude["Claude Code / Desktop"]
-        Inspector["MCP Inspector"]
-    end
+    Client["MCP Client<br/>Inspector / Cursor / Claude"]
+    HTTP["Streamable HTTP<br/>POST /mcp"]
+    Auth["Security Middleware<br/>Origin / Rate Limit / Auth / Validation"]
+    RBAC["Role-Based Tool Access"]
+    Tools["MCP Tools"]
+    ClientAPI["Instantly API Client"]
+    API["Instantly API v2"]
 
-    subgraph Entrypoints["Server Entrypoints"]
-        HTTP["Streamable HTTP (POST /mcp)"]
-        Stdio["Stdio (src/stdio.ts)"]
-    end
-
-    subgraph Pipeline["Security Middleware Pipeline (Express)"]
-        M1["1. Helmet & 100kb Body Limit (413)"]
-        M2["2. Origin Check (403 on disallowed, no wildcard)"]
-        M3["3. Rate Limiter (Token Hash / IP, 429)"]
-        M4["4. Constant-Time Bearer Auth (401 + WWW-Authenticate)"]
-    end
-
-    subgraph ServerInstance["Stateless McpServer Instance (per request)"]
-        Filter["Two-Layer Role Gating"]
-        VTools["Viewer Tools (6 read-only)"]
-        OTools["Operator Tools (add_lead, pause_campaign)"]
-        ATools["Admin Tools (activate_campaign + confirm)"]
-    end
-
-    subgraph ClientLayer["Instantly Client (src/instantly/client.ts)"]
-        Fetch["Fetch Wrapper (10s Timeout, Safe Retry for GET)"]
-        Mock["Mock DB (MOCK_MODE=true)"]
-        LiveAPI["Instantly API v2 (https://api.instantly.ai/api/v2)"]
-    end
-
-    Clients -->|Remote HTTP| HTTP
-    Clients -->|Local CLI| Stdio
-    HTTP --> Pipeline
-    Pipeline --> Filter
-    Stdio --> Filter
-    Filter --> VTools
-    Filter --> OTools
-    Filter --> ATools
-    VTools & OTools & ATools --> Fetch
-    Fetch -->|MOCK_MODE=true| Mock
-    Fetch -->|MOCK_MODE=false| LiveAPI
+    Client --> HTTP
+    HTTP --> Auth
+    Auth --> RBAC
+    RBAC --> Tools
+    Tools --> ClientAPI
+    ClientAPI --> API
 ```
 
----
-
-## Tools & Role Permissions
-
-The server implements **9 curated tools**. Each tool specifies exact Zod input schemas, pagination limits (`default: 20, max: 50`), and explicit **MCP Tool Annotations** (`readOnlyHint`, `destructiveHint`, `idempotentHint`).
-
-| Tool Name | Role | MCP Annotations | Description & Scope |
-| :--- | :--- | :--- | :--- |
-| **`list_campaigns`** | `viewer` | `readOnly: true`<br>`destructive: false`<br>`idempotent: true` | Lists cold email campaigns with status, timestamps, and cursor pagination. Does *not* return heavy lead arrays or email bodies. |
-| **`get_campaign`** | `viewer` | `readOnly: true`<br>`destructive: false`<br>`idempotent: true` | Retrieves schedule and sequence steps metadata for a campaign without dumping raw HTML bodies. |
-| **`get_campaign_analytics`** | `viewer` | `readOnly: true`<br>`destructive: false`<br>`idempotent: true` | Calculates performance metrics (leads, sent, opens, replies, bounces, open rate %, reply rate %). |
-| **`list_leads`** | `viewer` | `readOnly: true`<br>`destructive: false`<br>`idempotent: true` | Queries leads via Instantly v2's `POST /api/v2/leads/list`. Truncates text fields (~200 chars) to prevent prompt injection. |
-| **`list_email_accounts`** | `viewer` | `readOnly: true`<br>`destructive: false`<br>`idempotent: true` | Reports sender mailbox health, connection state, warmup status, and daily send limits. |
-| **`get_workspace_summary`** | `viewer` | `readOnly: true`<br>`destructive: false`<br>`idempotent: true` | **Composite executive summary**: Aggregates campaign status counts, account health breakdown, and total outreach KPIs into ONE compact response. |
-| **`add_lead`** | `operator` | `readOnly: false`<br>`destructive: false`<br>`idempotent: false` | Enrolls a new prospect into a campaign or list. Validates email syntax with Zod. Does *not* trigger immediate ad-hoc emails. |
-| **`pause_campaign`** | `operator` | `readOnly: false`<br>`destructive: true`<br>`idempotent: true` | Halts outgoing emails for an active campaign during maintenance or deliverability spikes. |
-| **`activate_campaign`** | `admin` | `readOnly: false`<br>`destructive: true`<br>`idempotent: true` | Starts campaign delivery. **Triple-gated**: requires `admin` role, `ENABLE_ADMIN_TOOLS=true`, and explicit `confirm: true`. |
+For local development, the same tool layer is also available through a **stdio entrypoint**.
 
 ---
 
-## Role-Based Access Control (RBAC)
+##  Tools
 
-Authentication uses three independent bearer tokens:
-1. `VIEWER_TOKEN` (Read-only operations)
-2. `OPERATOR_TOKEN` (Read-only + `add_lead`, `pause_campaign`)
-3. `ADMIN_TOKEN` (All tools, including `activate_campaign`)
+| Tool | Role | Purpose |
+|---|---|---|
+| `list_campaigns` | Viewer | List campaigns with pagination |
+| `get_campaign` | Viewer | Get campaign configuration/details |
+| `get_campaign_analytics` | Viewer | Get campaign performance metrics |
+| `list_leads` | Viewer | List/query leads |
+| `list_email_accounts` | Viewer | Check sender account health |
+| `get_workspace_summary` | Viewer | Combined workspace/campaign/account overview |
+| `add_lead` | Operator | Add a lead to a campaign/list |
+| `pause_campaign` | Operator | Pause an active campaign |
+| `activate_campaign` | Admin | Activate a campaign |
 
-### Two-Layer Enforcement (Defense in Depth)
-1. **Layer 1: Filter `tools/list`**: Only tools permitted for the token's role are registered on the `McpServer` instance. LLMs never discover tools outside their scope.
-2. **Layer 2: In-Handler Guard**: Every tool callback re-verifies `isRoleAuthorized(sessionRole, requiredRole)`. If an unauthorized client attempts a guessed `tools/call`, the request is rejected with an error.
+### Workspace Summary
 
----
+`get_workspace_summary` is a composite tool that combines commonly needed workspace information into one response:
 
-## Security Decisions & Architectural Tradeoffs
+- Campaign counts/status
+- Email account health
+- Total leads
+- Contacted leads
+- Emails sent
+- Opens / open rate
+- Replies / reply rate
+- Bounces
 
-### 1. Constant-Time Authentication with SHA-256 Pre-Hashing
-* **Decision**: Comparing tokens with `crypto.timingSafeEqual` directly will throw a runtime error in Node.js if the candidate string and secret string differ in length.
-* **Implementation**: We compute the SHA-256 digest of both the candidate token and the stored secret first. This guarantees both buffers are strictly 32 bytes, allowing safe constant-time comparison that eliminates both timing attacks and length disclosure.
-
-### 2. Static Bearer Tokens vs. OAuth 2.1
-* **Tradeoff**: We chose static bearer tokens as a deliberate, robust simplification for phase 1 deployment.
-* **Upgrade Path**: In a multi-tenant enterprise deployment, the upgrade path is **OAuth 2.1 with Proof Key for Code Exchange (PKCE)** and scoped JWT access tokens issued by an identity provider (e.g. Auth0, Okta, or Instantly OAuth). The middleware interface (`req.userRole`) is already decoupled and ready to accept JWT claims.
-
-### 3. Stateless Streamable HTTP Transport
-* **Decision**: The server runs in **stateless mode** (`sessionIdGenerator: undefined`).
-* **Rationale**: Multi-instance deployments (such as Render web service autoscaling) fail with stateful HTTP transports unless sticky sessions or centralized Redis session stores are implemented. Stateless mode handles each HTTP request as an independent JSON-RPC turn, enabling horizontal scaling, zero-downtime rolling deploys, and zero session-leak vulnerabilities.
-
-### 4. Strict Origin Verification (No Wildcard CORS)
-* If an `Origin` header is present, it is checked against `ALLOWED_ORIGINS`. Disallowed origins receive `403 Forbidden`.
-* Allowed origins receive exact header reflection (`Access-Control-Allow-Origin: <origin>`). Wildcard `*` CORS is strictly prohibited.
-* Non-browser clients (MCP Inspector, Cursor, Claude Code, curl) do not transmit an `Origin` header and are permitted through.
-
-### 5. Rate Limiting via Token Digest
-* Rate limits are tracked using the SHA-256 hash of the bearer token (with fallback to client IP).
-* This ensures raw authorization secrets are never stored in memory cache keys.
-
-### 6. Prompt Injection Defense via String Truncation
-* Untrusted strings from leads and campaigns (names, notes, email subjects) are sanitized and truncated to ~200 characters before inclusion in tool responses.
-* Upstream API errors are sanitized via `formatActionableErrorMessage()` — stack traces and raw upstream bodies are never exposed to LLM context.
-
-### 7. Structured Audit Logging
-* Built with `pino`, configured with automated redaction of Authorization headers, API keys, and tokens.
-* Dedicated audit helper logs one structured JSON line per tool execution: `timestamp`, `role`, `tool`, `success/failure`, and `durationMs`.
-* **Lead emails and message bodies are never logged.**
+This avoids requiring an MCP client/LLM to make several sequential tool calls for a basic workspace overview.
 
 ---
 
-## Environment Configuration
+## RBAC
 
-Copy `.env.example` to `.env` and configure your credentials:
+Three independent bearer tokens map to three roles:
+
+```text
+Viewer
+  └── 6 read-only tools
+
+Operator
+  ├── all Viewer tools
+  ├── add_lead
+  └── pause_campaign
+
+Admin
+  ├── all Operator tools
+  └── activate_campaign
+```
+
+### Two-Layer Enforcement
+
+**Layer 1 — Tool discovery**
+
+Only tools permitted for the authenticated role are exposed through `tools/list`.
+
+**Layer 2 — Tool execution**
+
+Every tool call checks the authenticated role again before execution.
+
+This means an unauthorized client cannot gain access simply by guessing a tool name.
+
+### Admin Activation Guard
+
+`activate_campaign` has an additional safety gate:
+
+```text
+Admin role
++ ENABLE_ADMIN_TOOLS=true
++ confirm=true
+```
+
+All three are required.
+
+---
+
+##  Security
+
+The server uses several layers of defense:
+
+- **Bearer authentication** with constant-time token comparison.
+- **Strict origin validation** instead of wildcard CORS.
+- **Rate limiting** using token digests/IP fallback.
+- **100 KB request body limit**.
+- **Zod input validation** for tool arguments.
+- **10-second upstream timeout**.
+- **Retries only for safe GET requests** on transient `429/5xx` failures.
+- **No automatic retries for writes**, avoiding accidental duplicate operations.
+- **Untrusted text is truncated/sanitized** before being returned to the model context.
+- **Upstream errors are sanitized** instead of exposing raw responses or stack traces.
+- **Pino structured logs** redact authorization headers, API keys, and tokens.
+- **Lead emails and message bodies are not written to audit logs.**
+
+---
+
+##  Key Design Decisions
+
+### Stateless Streamable HTTP
+
+The HTTP MCP server does not maintain per-session server state.
+
+This keeps deployment simple and makes the service easier to scale horizontally without requiring sticky sessions or a centralized session store.
+
+### Static Bearer Tokens
+
+For this project, static role tokens provide a simple authentication model suitable for a focused single-workspace deployment.
+
+For a larger multi-tenant deployment, the natural evolution would be OAuth 2.1 with scoped access tokens.
+
+### Safe Retry Policy
+
+The API client retries transient failures only for GET requests.
+
+Write operations are deliberately not retried automatically because retrying a failed write can create duplicate side effects.
+
+### Focused Tool Surface
+
+Instead of exposing every Instantly API endpoint, the server exposes a small set of purpose-built tools.
+
+This makes tool discovery easier for LLM clients and reduces the chance of unintended operations.
+
+---
+
+## Tech Stack
+
+- **Runtime:** Node.js 20+
+- **Language:** TypeScript
+- **MCP:** `@modelcontextprotocol/sdk`
+- **HTTP:** Express
+- **Validation:** Zod
+- **Logging:** Pino
+- **Testing:** Vitest + Supertest
+- **Deployment:** Render
+- **Upstream API:** Instantly API v2
+
+---
+
+## Local Setup
+
+### 1. Install
+
+```bash
+npm install
+```
+
+### 2. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-| Variable | Required | Default | Description |
-| :--- | :---: | :---: | :--- |
-| `INSTANTLY_API_KEY` | Yes | - | Instantly v2 API Key (minimum 32 characters) |
-| `VIEWER_TOKEN` | Yes | - | Static bearer token for Viewer role (minimum 32 chars) |
-| `OPERATOR_TOKEN` | Yes | - | Static bearer token for Operator role (minimum 32 chars) |
-| `ADMIN_TOKEN` | Yes | - | Static bearer token for Admin role (minimum 32 chars) |
-| `ALLOWED_ORIGINS` | No | `""` | Comma-separated list of allowed browser origins |
-| `ENABLE_ADMIN_TOOLS`| No | `false`| Enable destructive admin operations (`activate_campaign`) |
-| `MOCK_MODE` | No | `false`| When `true`, returns realistic simulated data |
-| `PORT` | No | `3000` | HTTP port to listen on (Render overrides this automatically) |
-| `LOG_LEVEL` | No | `info` | Logging verbosity (`info`, `debug`, `warn`, `error`, `silent`) |
+Set:
 
----
+```text
+INSTANTLY_API_KEY=...
+VIEWER_TOKEN=...
+OPERATOR_TOKEN=...
+ADMIN_TOKEN=...
+```
 
-## Local Development & Testing
+Optional:
 
-### 1. Build and Run Server Locally
+```text
+ENABLE_ADMIN_TOOLS=false
+MOCK_MODE=false
+ALLOWED_ORIGINS=
+PORT=3000
+LOG_LEVEL=info
+```
+
+Never commit `.env` or real credentials.
+
+### 3. Build
+
 ```bash
 npm run build
+```
+
+### 4. Start
+
+```bash
 npm start
-# or during active development:
+```
+
+For development:
+
+```bash
 npm run dev
 ```
 
-### 2. Verify Over Local Streamable HTTP
-Run the built-in live HTTP verification script (tests `/health`, `POST /mcp` initialize, `tools/list`, and tool invocations):
-```bash
-npm run test:live
-```
+---
 
-### 3. Run Automated Vitest Suite (20 Tests)
+## Testing
+
+Run the automated test suite:
+
 ```bash
 npm test
 ```
 
-### 4. Connect via MCP Inspector
-**Option A: Over Stdio (Admin Mode)**
+The suite covers authentication, security middleware, RBAC, validation, tool behavior, aggregation, and secret-leakage checks.
+
+You can also run the live HTTP verification:
+
 ```bash
-npx @modelcontextprotocol/inspector node dist/stdio.js
+npm run test:live
 ```
 
-**Option B: Over Streamable HTTP**
-Start the server with `npm start`, then in a new terminal:
+This verifies the HTTP server, MCP initialization, tool discovery, and tool execution.
+
+---
+
+## MCP Inspector
+
+Start Inspector:
+
 ```bash
 npx @modelcontextprotocol/inspector
 ```
-In the Inspector web interface:
-* **Transport Type**: `Streamable HTTP`
-* **URL**: `http://localhost:3000/mcp`
-* **Headers**: `Authorization: Bearer <YOUR_VIEWER_OR_ADMIN_TOKEN>`
 
----
+Configure:
 
-## Client Integration Guides
-
-### Cursor
-Add to your project's `.cursor/mcp.json`:
-```json
-{
-  "mcpServers": {
-    "instantly": {
-      "url": "http://localhost:3000/mcp",
-      "headers": {
-        "Authorization": "Bearer your_viewer_or_operator_token_here_32chars"
-      }
-    }
-  }
-}
-```
-*(For production, replace `http://localhost:3000/mcp` with your Render service URL, e.g., `https://instantly-mcp.onrender.com/mcp`).*
-
-### Claude Code / Claude Desktop
-Add to your `claude_desktop_config.json`:
-```json
-{
-  "mcpServers": {
-    "instantly": {
-      "command": "node",
-      "args": ["/absolute/path/to/instantly-mcp-server/dist/stdio.js"],
-      "env": {
-        "INSTANTLY_API_KEY": "your_instantly_api_key_here",
-        "MOCK_MODE": "false"
-      }
-    }
-  }
-}
+```text
+Transport: Streamable HTTP
+URL: https://nstantly-mcp-server.onrender.com/mcp
 ```
 
----
+Add the appropriate role token under **Custom Headers**:
 
-## Deploying to Render
+```text
+Name: Authorization
+Value: Bearer <YOUR_TOKEN>
+```
 
-This repository includes a production-ready [`render.yaml`](file:///Users/garvit/Desktop/projects/MCP%20server%20instantly/render.yaml) blueprint with **zero secrets committed**.
+### Expected tools
 
-### Step-by-Step Deployment:
-1. Initialize git and push to your GitHub repository:
-   ```bash
-   git init
-   git add .
-   git commit -m "feat: Instantly.ai MCP Server"
-   git branch -M main
-   git remote add origin https://github.com/<your-username>/<your-repo-name>.git
-   git push -u origin main
-   ```
-2. Open the [Render Dashboard](https://dashboard.render.com).
-3. Click **New +** ➔ **Blueprint**.
-4. Select your GitHub repository.
-5. Render reads `render.yaml` and securely prompts you for:
-   * `INSTANTLY_API_KEY`
-   * `VIEWER_TOKEN`
-   * `OPERATOR_TOKEN`
-   * `ADMIN_TOKEN`
-6. Click **Apply**. Render will automatically build (`npm ci && npm run build`), start (`node dist/server.js`), and monitor the health check at `/health`.
+**Viewer:** 6 tools
+
+**Operator:** 8 tools
+
+**Admin:** 9 tools
+
+For safety, `activate_campaign` should only be exposed when the admin feature flag is enabled, and the tool still requires `confirm: true`.
 
 ---
 
-## Known Limitations & Boundaries
-* **Read-Only by Default**: The server intentionally defaults to read-only semantics. Write and activation tools require elevated roles and explicit confirmation.
-* **Bulk Operations Excluded**: Bulk CSV uploads and multi-account mass migrations are deliberately omitted to preserve LLM response determinism and prevent unintended quota exhaustion.
-* **Upstream Rate Limits**: Instantly v2 enforces workspace-wide rate limits (100 req/sec, 6,000 req/min). The server's client automatically retries transient 429s for GET requests up to 2 times, but prolonged rate limiting will return clear actionable error messages to the LLM.
+## Project Structure
+
+```text
+src/
+├── app.ts                  # Express + MCP HTTP application
+├── server.ts               # HTTP server entrypoint
+├── stdio.ts                # Local stdio MCP entrypoint
+├── config.ts               # Environment validation
+├── logger.ts               # Structured/redacted logging
+├── instantly/
+│   ├── client.ts           # Instantly API client
+│   └── errors.ts            # Sanitized upstream errors
+└── tools/
+    ├── registry.ts         # Role-based tool registration
+    ├── viewer.ts           # Read-only tools
+    ├── operator.ts         # Operator tools
+    └── admin.ts            # Admin tools
+```
+
+---
+
+##  Boundaries
+
+This project intentionally does **not** expose bulk or mass-operation workflows.
+
+The focus is on a small, predictable tool surface that an LLM can use safely.
+
+The current authentication model is also intentionally simple. Production multi-tenant deployments would benefit from OAuth-based identity and scoped authorization.
+
+---
+
+## Why This Project
+
+The project explores what it takes to turn a conventional REST API into a **safe, usable MCP interface** — not just by wrapping endpoints, but by adding:
+
+- role-aware tool discovery,
+- server-side authorization,
+- input validation,
+- safe upstream behavior,
+- security boundaries,
+- structured observability,
+- and LLM-oriented tool design.
