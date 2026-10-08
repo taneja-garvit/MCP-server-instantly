@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: instantly-mcp-server
+    runtime: node
+    plan: starter
+    region: oregon
+    buildCommand: npm ci && npm run build
+    startCommand: node dist/server.js
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: ENABLE_ADMIN_TOOLS
+        value: "false"
+      - key: MOCK_MODE
+        value: "false"
+      - key: LOG_LEVEL
+        value: info
+      - key: ALLOWED_ORIGINS
+        value: ""
+
+      # Secrets: sync: false tells Render to prompt for these securely
+      # in the web dashboard during setup without storing secrets in git
+      - key: INSTANTLY_API_KEY
+        sync: false
+      - key: VIEWER_TOKEN
+        sync: false
+      - key: OPERATOR_TOKEN
+        sync: false
+      - key: ADMIN_TOKEN
+        sync: false
