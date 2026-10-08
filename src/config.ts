@@ -73,7 +73,17 @@ const envSchema = z.object({
   LOG_LEVEL: z
     .enum(["silent", "trace", "debug", "info", "warn", "error", "fatal"])
     .default("info"),
-});
+}).refine(
+  (data) =>
+    data.VIEWER_TOKEN !== data.OPERATOR_TOKEN &&
+    data.OPERATOR_TOKEN !== data.ADMIN_TOKEN &&
+    data.VIEWER_TOKEN !== data.ADMIN_TOKEN,
+  {
+    message:
+      "VIEWER_TOKEN, OPERATOR_TOKEN, and ADMIN_TOKEN must each be unique distinct secrets to enforce role security",
+    path: ["VIEWER_TOKEN"],
+  }
+);
 
 export type Config = z.infer<typeof envSchema>;
 

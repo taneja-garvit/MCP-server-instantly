@@ -4,15 +4,16 @@ import { logger } from "./logger.js";
 
 const app = createApp();
 
-const server = app.listen(config.PORT, () => {
+const server = app.listen(config.PORT, "0.0.0.0", () => {
   logger.info(
     {
       port: config.PORT,
+      host: "0.0.0.0",
       mockMode: config.MOCK_MODE,
       adminToolsEnabled: config.ENABLE_ADMIN_TOOLS,
       allowedOriginsCount: config.ALLOWED_ORIGINS.length,
     },
-    `Instantly MCP server listening on port ${config.PORT} (Streamable HTTP)`
+    `Instantly MCP server listening on 0.0.0.0:${config.PORT} (Streamable HTTP)`
   );
 });
 
